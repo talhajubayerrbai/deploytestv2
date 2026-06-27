@@ -1,0 +1,234 @@
+name: Deploy FastAPI to EC2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  #  1. Test 
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          pip install gunicorn uvicorn[standard] fastapi pytest httpx
+
+      - name: Lint (advisory only - never blocks deploy)
+        run: |
+          pip install flake8 || true
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics || true
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics || true
+
+        continue-on-error: true
+      - name: Run tests
+        run: |
+          if [ -d tests ] && ls tests/test_*.py &>/dev/null; then
+            pytest tests/ -v
+          else
+            echo "No tests found - skipping."
+          fi
+
+  #  2. Build / Provision infrastructure 
+  build:
+    name: Provision Infrastructure (Terraform)
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      server_ip: ${{ steps.tf_output.outputs.server_ip }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+          terraform_wrapper: false
+
+      - name: Generate SSH key pair
+        run: |
+          ssh-keygen -t rsa -b 4096 -f /tmp/deploy_key -N "" -C "udap-deploy"
+          echo "SSH_PUBLIC_KEY=$(cat /tmp/deploy_key.pub)" >> $GITHUB_ENV
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+
+      - name: Terraform Validate
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: terraform
+        run: |
+          terraform plan \
+            -var="public_key=${{ env.SSH_PUBLIC_KEY }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: Extract Terraform output
+        id: tf_output
+        working-directory: terraform
+        run: |
+          SERVER_IP=$(terraform output -raw instance_public_ip)
+          echo "server_ip=${SERVER_IP}" >> $GITHUB_OUTPUT
+          echo "SERVER_IP=${SERVER_IP}" >> $GITHUB_ENV
+
+      - name: Save SSH private key and server IP as artifacts
+        run: |
+          mkdir -p /tmp/deploy-artifacts
+          cp /tmp/deploy_key /tmp/deploy-artifacts/deploy_key
+          echo "${{ steps.tf_output.outputs.server_ip }}" > /tmp/deploy-artifacts/server_ip.txt
+
+      - name: Upload deploy artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-artifacts
+          path: /tmp/deploy-artifacts/
+          retention-days: 1
+
+  #  3. Deploy app via Ansible 
+  deploy:
+    name: Deploy Application (Ansible)
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Download deploy artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: deploy-artifacts
+          path: /tmp/deploy-artifacts/
+
+      - name: Prepare SSH key and server IP
+        run: |
+          chmod 600 /tmp/deploy-artifacts/deploy_key
+          SERVER_IP=$(cat /tmp/deploy-artifacts/server_ip.txt)
+          echo "SERVER_IP=${SERVER_IP}" >> $GITHUB_ENV
+
+      - name: Install Ansible
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible
+
+      - name: Wait for EC2 SSH to be ready
+        run: |
+          echo "Waiting for SSH on ${{ env.SERVER_IP }}..."
+          for i in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no \
+                   -o ConnectTimeout=5 \
+                   -o BatchMode=yes \
+                   -i /tmp/deploy-artifacts/deploy_key \
+                   ubuntu@${{ env.SERVER_IP }} 'echo ready' 2>/dev/null; then
+              echo "SSH is ready."
+              break
+            fi
+            echo "Attempt $i/30 - retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Run Ansible playbook
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook \
+            -i "${{ env.SERVER_IP }}," \
+            --private-key /tmp/deploy-artifacts/deploy_key \
+            -u ubuntu \
+            ansible/playbook.yml
+
+      - name: Smoke test - verify public endpoint responds
+        run: |
+          SERVER_IP="${{ env.SERVER_IP }}"
+          echo "Smoke-testing http://${SERVER_IP}/health ..."
+          for i in $(seq 1 12); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://${SERVER_IP}/health" || true)
+            echo "Attempt $i - HTTP status: ${STATUS}"
+            if echo "$STATUS" | grep -qE '^(2[0-9]{2}|3[0-9]{2})$'; then
+              echo "Smoke test PASSED (status ${STATUS})"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Smoke test FAILED - app did not return 2xx/3xx after 12 attempts"
+          exit 1
+
+  #  4. Destroy (manual / cleanup) 
+  destroy:
+    name: Destroy Infrastructure
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: ${{ github.event.inputs.destroy == 'true' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+
+      - name: Terraform Destroy
+        working-directory: terraform
+        run: |-
+          terraform destroy -auto-approve \
+            -var="public_key=placeholder-destroy-key" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}"
