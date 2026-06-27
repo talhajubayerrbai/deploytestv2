@@ -1,4 +1,4 @@
-name: Destroy deploytestv2
+name: Destroy deploytestv2-dev
 
 on:
   workflow_dispatch:

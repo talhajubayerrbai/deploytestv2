@@ -6,6 +6,10 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
   }
 
   backend "s3" {}
@@ -18,26 +22,23 @@ provider "aws" {
 #  Variables 
 
 variable "aws_region" {
-  description = "AWS region"
-  type        = string
-  default     = "us-east-1"
+  type    = string
+  default = "us-east-1"
 }
 
 variable "project_name" {
-  description = "Project name used for resource naming"
-  type        = string
-  default     = "udap-app"
+  type    = string
+  default = "deploytestv2"
 }
 
 variable "instance_type" {
-  description = "EC2 instance type"
-  type        = string
-  default     = "t3.micro"
+  type    = string
+  default = "t3.micro"
 }
 
 variable "public_key" {
-  description = "SSH public key material to inject into the EC2 instance"
   type        = string
+  description = "SSH public key material (contents of id_rsa.pub)"
 }
 
 #  Data sources 
@@ -57,19 +58,12 @@ data "aws_ami" "ubuntu" {
   }
 }
 
-#  SSH key pair 
-
-resource "aws_key_pair" "app" {
-  key_name   = "${var.project_name}-key"
-  public_key = var.public_key
-}
-
 #  Networking 
 
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
-  enable_dns_support   = true
   enable_dns_hostnames = true
+  enable_dns_support   = true
 
   tags = {
     Name    = "${var.project_name}-vpc"
@@ -89,8 +83,8 @@ resource "aws_internet_gateway" "main" {
 resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.1.0/24"
-  map_public_ip_on_launch = true
   availability_zone       = "${var.aws_region}a"
+  map_public_ip_on_launch = true
 
   tags = {
     Name    = "${var.project_name}-public-subnet"
@@ -120,22 +114,22 @@ resource "aws_route_table_association" "public" {
 #  Security group 
 
 resource "aws_security_group" "app" {
-  name        = "${var.project_name}-sg"
+  name        = "${var.project_name}-app-sg"
   description = "Allow HTTP and SSH"
   vpc_id      = aws_vpc.main.id
-
-  ingress {
-    description = "HTTP"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
 
   ingress {
     description = "SSH"
     from_port   = 22
     to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "HTTP"
+    from_port   = 80
+    to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -148,7 +142,18 @@ resource "aws_security_group" "app" {
   }
 
   tags = {
-    Name    = "${var.project_name}-sg"
+    Name    = "${var.project_name}-app-sg"
+    Project = var.project_name
+  }
+}
+
+#  SSH key pair 
+
+resource "aws_key_pair" "app" {
+  key_name   = "${var.project_name}-key"
+  public_key = var.public_key
+
+  tags = {
     Project = var.project_name
   }
 }
@@ -168,12 +173,12 @@ resource "aws_instance" "app" {
   }
 
   tags = {
-    Name    = "${var.project_name}-instance"
+    Name    = "${var.project_name}-app"
     Project = var.project_name
   }
 }
 
-#  Static (Elastic) IP 
+#  Static / Elastic IP 
 
 resource "aws_eip" "app" {
   instance = aws_instance.app.id
@@ -183,16 +188,23 @@ resource "aws_eip" "app" {
     Name    = "${var.project_name}-eip"
     Project = var.project_name
   }
+
+  depends_on = [aws_internet_gateway.main]
 }
 
 #  Outputs 
 
 output "instance_public_ip" {
-  description = "Static public IP of the EC2 instance"
   value       = aws_eip.app.public_ip
+  description = "Static public IP of the EC2 instance"
 }
 
 output "app_url" {
-  description = "Public HTTP URL of the application"
   value       = "http://${aws_eip.app.public_ip}"
+  description = "Public URL of the application"
+}
+
+output "health_url" {
+  value       = "http://${aws_eip.app.public_ip}/health"
+  description = "Health check endpoint"
 }
